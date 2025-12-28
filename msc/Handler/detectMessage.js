@@ -481,9 +481,10 @@ async function detectMessage(client) {
                 }
 
                 // ECONOMY
-                if (['gold', 'cash', 'bal', 'give', 'pay', 'daily', 'shop'].includes(commandName)) {
+                if (['gold', 'cash', 'bal', 'give', 'pay', 'daily', 'shop', 'buygold', 'topup', 'recharge', 'purchasegold'].includes(commandName)) {
                     if (commandName === 'bal') commandName = 'cash';
                     else if (commandName === 'pay') commandName = 'give';
+                    else if (commandName === 'topup' || commandName === 'recharge' || commandName === 'purchasegold') commandName = 'buygold';
                     const economy = getEconomy.get(commandName) || (getEconomy.find ? getEconomy.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
                     if (!economy) return;
                     economy.execute(client, message, args);
