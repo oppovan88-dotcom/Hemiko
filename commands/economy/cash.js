@@ -237,8 +237,7 @@ module.exports = {
                     `${limitHeader}\n` +
                     `${limitBody}` +
                     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `${footerText}\n\n` +
-                    `💳 **Tip:** Use \`hm buygold\` to buy Gold with Wing/Bakong!`
+                    `${footerText}`
                 )
                 .setFooter({
                     text: `Daily reset at 12:00 AM | Phnom Penh`,

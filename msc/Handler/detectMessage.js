@@ -433,23 +433,6 @@ async function detectMessage(client) {
                 }
 
                 // GAMES (multiple)
-                // Special handling: if commandName is 'hm' and first arg is a valid economy/other command, redirect
-                if (commandName === 'hm' && args[0]) {
-                    const subCommand = args[0].toLowerCase();
-                    const economySubCommands = ['buygold', 'topup', 'recharge', 'purchasegold', 'gold', 'cash', 'bal', 'give', 'pay', 'daily', 'shop'];
-                    if (economySubCommands.includes(subCommand)) {
-                        // Redirect to economy command
-                        commandName = subCommand;
-                        args.shift(); // Remove the subcommand from args
-                        if (commandName === 'bal') commandName = 'cash';
-                        else if (commandName === 'pay') commandName = 'give';
-                        else if (commandName === 'topup' || commandName === 'recharge' || commandName === 'purchasegold') commandName = 'buygold';
-                        const economy = getEconomy.get(commandName) || (getEconomy.find ? getEconomy.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                        if (!economy) return;
-                        economy.execute(client, message, args);
-                        return;
-                    }
-                }
 
                 const gameAliases = ['hm', 'ttt', 'c4', 'rps', 'trivia', 'connect4', 'rockpaperscissors', 'wordle', 'tictactoe', 'minesweeper', 'hangman', 'snake', 'sa', 'survival', 'race', 'bankrob', 'br', 'guess'];
                 if (gameAliases.includes(commandName)) {
@@ -498,10 +481,9 @@ async function detectMessage(client) {
                 }
 
                 // ECONOMY
-                if (['gold', 'cash', 'bal', 'give', 'pay', 'daily', 'shop', 'buygold', 'topup', 'recharge', 'purchasegold'].includes(commandName)) {
+                if (['gold', 'cash', 'bal', 'give', 'pay', 'daily', 'shop'].includes(commandName)) {
                     if (commandName === 'bal') commandName = 'cash';
                     else if (commandName === 'pay') commandName = 'give';
-                    else if (commandName === 'topup' || commandName === 'recharge' || commandName === 'purchasegold') commandName = 'buygold';
                     const economy = getEconomy.get(commandName) || (getEconomy.find ? getEconomy.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
                     if (!economy) return;
                     economy.execute(client, message, args);
