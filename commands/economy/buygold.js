@@ -12,6 +12,9 @@ var prem = [];
 // Log channel for gold purchases
 const GOLD_PURCHASE_LOG_CHANNEL_ID = '1454885535494443038';
 
+// ======================== PAYMENT SERVER URL ========================
+const PAYMENT_SERVER_URL = process.env.PAYMENT_SERVER_URL || 'http://localhost:3001';
+
 // ======================== BAKONG WING CONFIGURATION (from .env) ========================
 const BAKONG_CONFIG = {
     // Bakong Account ID (from .env) - format: username@bank
@@ -115,52 +118,44 @@ async function generateQRImage(text) {
 }
 
 /**
- * Check payment status via Bakong API
+ * Check payment status via Backend Server (which calls Bakong API)
  * @param {string} md5 - MD5 hash of the QR code
+ * @param {string} transactionId - Transaction ID (optional)
  * @returns {object} - Payment status
  */
-async function checkPaymentStatus(md5) {
+async function checkPaymentStatus(md5, transactionId = null) {
     const axios = require('axios');
     try {
-        console.log(`[Bakong] Checking payment for MD5: ${md5}`);
+        console.log(`[Payment] Checking payment via backend server for MD5: ${md5}`);
 
         const response = await axios.post(
-            'https://api-bakong.nbc.gov.kh/v1/check_transaction_by_md5',
-            { md5: md5 },
+            `${PAYMENT_SERVER_URL}/api/check-payment`,
+            { md5: md5, transactionId: transactionId },
             {
-                headers: {
-                    'Authorization': `Bearer ${BAKONG_CONFIG.apiToken}`,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 15000
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 25000
             }
         );
 
-        console.log(`[Bakong] API Response:`, JSON.stringify(response.data));
+        console.log(`[Payment] Backend Response:`, JSON.stringify(response.data));
 
-        // Check if payment was successful
-        // responseCode === 0 means success, or check for data.data array
-        if (response.data) {
-            // Check various success indicators
-            if (response.data.responseCode === 0 ||
-                (response.data.data && response.data.data.length > 0)) {
-                console.log(`[Bakong] Payment CONFIRMED!`);
-                return {
-                    success: true,
-                    paid: true,
-                    data: response.data
-                };
-            }
+        if (response.data.paid) {
+            console.log(`[Payment] ✅ Payment CONFIRMED!`);
+            return {
+                success: true,
+                paid: true,
+                data: response.data.data
+            };
         }
 
-        console.log(`[Bakong] Payment NOT found yet`);
+        console.log(`[Payment] Payment NOT found yet`);
         return {
             success: true,
             paid: false,
-            data: response.data
+            data: response.data.data
         };
     } catch (error) {
-        console.error('[Bakong] Payment Check Error:', error.response?.data || error.message);
+        console.error('[Payment] Check Error:', error.response?.data || error.message);
         return {
             success: false,
             paid: false,
@@ -168,6 +163,39 @@ async function checkPaymentStatus(md5) {
         };
     }
 }
+
+/**
+ * Generate Bakong Deep Link via Backend Server
+ */
+async function generateDeeplink(qrString, client) {
+    const axios = require('axios');
+    try {
+        console.log(`[Payment] Generating deeplink via backend server...`);
+
+        const response = await axios.post(
+            `${PAYMENT_SERVER_URL}/api/generate-deeplink`,
+            {
+                qrString: qrString,
+                appIconUrl: client.user.displayAvatarURL({ extension: 'png' }),
+                appName: 'Yukio Bot'
+            },
+            {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 15000
+            }
+        );
+
+        if (response.data.success && response.data.shortLink) {
+            console.log(`[Payment] Deeplink generated: ${response.data.shortLink}`);
+            return response.data.shortLink;
+        }
+        return null;
+    } catch (error) {
+        console.error('[Payment] Deeplink Error:', error.message);
+        return null;
+    }
+}
+
 
 // ======================== PENDING TRANSACTIONS STORE ========================
 const pendingTransactions = new Map();
@@ -278,6 +306,9 @@ module.exports = {
             };
             pendingTransactions.set(transactionId, transactionData);
 
+            // Generate Deep Link for Mobile Users
+            const deeplink = await generateDeeplink(qrData.qrString, client);
+
             // Create buttons
             const row = new ActionRowBuilder()
                 .addComponents(
@@ -291,27 +322,35 @@ module.exports = {
                         .setStyle(ButtonStyle.Danger)
                 );
 
-            // Create payment embed
+            if (deeplink) {
+                row.addComponents(
+                    new ButtonBuilder()
+                        .setLabel('📱 Open in Bank App')
+                        .setURL(deeplink)
+                        .setStyle(ButtonStyle.Link)
+                );
+            }
+
+            // Create payment embed with Premium Bot Aesthetics
             const paymentEmbed = customEmbed()
-                .setColor('#E91E63')
-                .setTitle('💳 Payment QR Code Generated')
+                .setColor('#FFD700') // Gold color
+                .setTitle('� Premium Gold Purchase')
+                .setThumbnail(gif.gold_coin_gif || null)
                 .setDescription(
-                    `**Scan this QR code** with your banking app to pay.\n\n` +
+                    `✨ **Order Details** ✨\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `${gif.gold_coin} **Gold:** \`${goldAmount.toLocaleString()}\` Gold\n` +
-                    `💵 **Amount:** \`$${amountUSD.toFixed(2)}\` USD *(Auto-filled)*\n` +
-                    `🆔 **Order:** \`${transactionId}\`\n` +
+                    `💰 **Receiving:** ${gif.gold_coin} \`${goldAmount.toLocaleString()}\` Gold\n` +
+                    `💵 **Amount Due:** \`$${amountUSD.toFixed(2)}\` USD\n` +
+                    `🆔 **Order Ref:** \`${transactionId}\`\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-                    `⏰ **Expires:** <t:${Math.floor(transactionData.expiresAt / 1000)}:R>\n\n` +
-                    `**Instructions:**\n` +
-                    `1️⃣ Open **Wing/Bakong/ABA** app\n` +
-                    `2️⃣ Scan the QR code\n` +
-                    `3️⃣ Amount **$${amountUSD.toFixed(2)}** is auto-filled!\n` +
-                    `4️⃣ Confirm payment\n` +
-                    `5️⃣ Click **"✅ I have paid"**`
+                    `📱 **How to Pay:**\n` +
+                    `1️⃣ Click **"Open in Bank App"** or scan the QR code below.\n` +
+                    `2️⃣ The amount is auto-filled. Just confirm!\n` +
+                    `3️⃣ Click **"✅ I have paid"** when finished.\n\n` +
+                    `⏰ **Expires:** <t:${Math.floor(transactionData.expiresAt / 1000)}:R>`
                 )
                 .setImage('attachment://payment_qr.png')
-                .setFooter({ text: `Pay to: ${BAKONG_CONFIG.accountNumber}` })
+                .setFooter({ text: `Account: ${BAKONG_CONFIG.accountNumber} • Fast & Secure` })
                 .setTimestamp();
 
             const paymentMessage = await message.channel.send({
