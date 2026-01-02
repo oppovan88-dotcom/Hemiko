@@ -1,23 +1,12 @@
 {
-  "name": "yukio-bot",
-  "version": "1.0.0",
-  "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "server": "node server/index.js",
-    "server:dev": "nodemon server/index.js",
-    "all": "node index.js & node server/index.js"
-  },
   "dependencies": {
     "axios": "^1.13.2",
     "bakong-khqr": "^1.0.20",
     "canvas": "^3.2.0",
-    "cors": "^2.8.5",
     "discord": "^0.8.2",
     "discord-gamecord": "^4.4.2",
     "discord.js": "^14.15.3",
     "dotenv": "^16.4.5",
-    "express": "^4.22.1",
     "https-proxy-agent": "^7.0.6",
     "moment-timezone": "^0.5.45",
     "mongoose": "^8.1.3",
