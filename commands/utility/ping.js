@@ -1,33 +1,19 @@
-const { SimpleEmbed, cooldown, sym, getUser } = require('../../functioon/function');
-
-const cooldowns = new Map();
-let CDT = 25_000;
-var getId = [];
-var cdId = [];
-var prem = [];
+const { EmbedBuilder } = require('discord.js');
 
 module.exports = {
     name: 'ping',
     async execute(client, message, args) {
-        try{
-            const user = message.author;
+        try {
+            // Calculate latency immediately without any database calls
+            const latency = Date.now() - message.createdTimestamp;
+            const apiPing = Math.round(client.ws.ping);
 
-            const userData = await getUser(user.id);
+            const embed = new EmbedBuilder()
+                .setColor('#00FF00')
+                .setDescription(`🏓 **Pong!** to ${message.author.displayName}\n\n⏱️ Latency: **${latency}ms**\n💓 API: **${apiPing}ms**`);
 
-            if(userData.premium.premium_bool){
-                if(!prem.includes(user.id)){
-                    prem.push(user.id);
-                }
-            }
-
-            if(cooldown(user.id, getId, cdId, CDT, message, cooldowns, prem)){
-                return;
-            };
-
-            let ms = parseInt(Date.now() - message.createdTimestamp);
-            
-            message.channel.send({ embeds: [SimpleEmbed(`🏓 Pong! to ${user.displayName} in **${ms}**ms.`, message)] });
-        }catch(error){
+            message.channel.send({ embeds: [embed] });
+        } catch (error) {
             console.log(`ping error ${error}`);
         }
     },

@@ -8,11 +8,14 @@ const { getUser, ButtonStyle, oneButton, labelButton, getCollectionButton, sym, 
 // Auto-ban log channel ID for spam/auto-click detection
 const AUTO_BAN_LOG_CHANNEL_ID = '1451597788965109953';
 const config = require('../../config');
-const fs = require('fs').promises; // use promise-based fs
-const fsSync = require('fs'); // for sync reads where needed
+const fs = require('fs').promises;
+const fsSync = require('fs');
 
+// ======================== CACHED DATA (LOAD ONCE) ========================
 let banlist = [];
 let serverlist = [];
+let banlistLastModified = 0;
+let serverlistLastModified = 0;
 
 const AUTOMATION_THRESHOLD = 5;
 const TIME_WINDOW = 10000;
@@ -21,9 +24,69 @@ let messageCache = {};
 const userFirstCommandTimes = new Map();
 const TIMES = 1 * 60 * 60 * 1000;
 
+// ======================== USER DATA CACHE ========================
+const userDataCache = new Map();
+const USER_CACHE_TTL = 60000; // 1 minute cache
+
+async function getCachedUser(userId) {
+    const cached = userDataCache.get(userId);
+    if (cached && Date.now() - cached.timestamp < USER_CACHE_TTL) {
+        return cached.data;
+    }
+    const userData = await getUser(userId);
+    if (userData) {
+        userDataCache.set(userId, { data: userData, timestamp: Date.now() });
+    }
+    return userData;
+}
+
+// ======================== LOAD BANLISTS (CACHED) ========================
+function loadBanlistSync() {
+    try {
+        if (!fsSync.existsSync('./banlist.json')) return [];
+        const stats = fsSync.statSync('./banlist.json');
+        if (stats.mtimeMs === banlistLastModified) return banlist; // No change
+        banlistLastModified = stats.mtimeMs;
+        const data = fsSync.readFileSync('./banlist.json', 'utf8');
+        return JSON.parse(data || '[]');
+    } catch (error) {
+        console.error('Error loading banlist sync:', error);
+        return banlist; // Return cached version on error
+    }
+}
+
+function loadServerlistSync() {
+    try {
+        if (!fsSync.existsSync('./banServerlist.json')) return [];
+        const stats = fsSync.statSync('./banServerlist.json');
+        if (stats.mtimeMs === serverlistLastModified) return serverlist; // No change
+        serverlistLastModified = stats.mtimeMs;
+        const data = fsSync.readFileSync('./banServerlist.json', 'utf8');
+        return JSON.parse(data || '[]');
+    } catch (error) {
+        console.error('Error loading serverlist sync:', error);
+        return serverlist; // Return cached version on error
+    }
+}
+
+async function saveBanlistToFile(list) {
+    try {
+        await fs.writeFile('./banlist.json', JSON.stringify(list, null, 2), 'utf8');
+        banlistLastModified = Date.now();
+        banlist = list;
+    } catch (error) {
+        console.error('Error saving banlist:', error);
+    }
+}
+
+// ======================== RELOAD BANLISTS PERIODICALLY (NOT EVERY MESSAGE) ========================
+setInterval(() => {
+    banlist = loadBanlistSync();
+    serverlist = loadServerlistSync();
+}, 30000); // Reload every 30 seconds instead of every message
+
 async function detectMessage(client) {
     try {
-
         const {
             getEconomy, getGambling, getUtility, getSocial, getGiveaway, getAdmin,
             getWork, getMine, getGame, getRank, getDragon, getAnimal, getFarm, getSlashCommands
@@ -31,486 +94,273 @@ async function detectMessage(client) {
         const { leveling } = require('../../events/leveling');
         const { prem } = require('../../events/premium');
 
-        // Safely load banlists at startup (and provide functions to reload)
-        function loadBanlistSync() {
-            try {
-                if (!fsSync.existsSync('./banlist.json')) return [];
-                const data = fsSync.readFileSync('./banlist.json', 'utf8');
-                return JSON.parse(data || '[]');
-            } catch (error) {
-                console.error('Error loading banlist sync:', error);
-                return [];
-            }
-        }
-        function loadServerlistSync() {
-            try {
-                if (!fsSync.existsSync('./banServerlist.json')) return [];
-                const data = fsSync.readFileSync('./banServerlist.json', 'utf8');
-                return JSON.parse(data || '[]');
-            } catch (error) {
-                console.error('Error loading serverlist sync:', error);
-                return [];
-            }
-        }
-
+        // Initial load
         banlist = loadBanlistSync();
         serverlist = loadServerlistSync();
 
-        async function loadBanlist() {
-            try {
-                if (!fsSync.existsSync('./banlist.json')) return [];
-                const data = await fs.readFile('./banlist.json', 'utf8');
-                return JSON.parse(data || '[]');
-            } catch (error) {
-                console.error('Error loading banlist:', error);
-                return [];
-            }
-        }
-
-        async function saveBanlistToFile(list) {
-            try {
-                await fs.writeFile('./banlist.json', JSON.stringify(list, null, 2), 'utf8');
-            } catch (error) {
-                console.error('Error saving banlist:', error);
-            }
-        }
-
-        // centralized log sending - can send to channels in any server by fetching channel from client
-        async function logToChannel(channelId, text) {
-            try {
-                if (!channelId) return;
-                const logChannel = await client.channels.fetch(channelId).catch(() => null);
-                if (!logChannel) {
-                    console.warn(`Log channel ${channelId} not found.`);
-                    return;
-                }
-                // some channel types don't support send; check
-                if (typeof logChannel.send === 'function') {
-                    await logChannel.send({ content: text }).catch(err => {
-                        console.error(`Failed to send log to ${channelId}:`, err);
-                    });
-                }
-            } catch (err) {
-                console.error("Logging error (fetch/send):", err);
-            }
+        // ======================== NON-BLOCKING LOG (Fire and forget) ========================
+        function logToChannelAsync(channelId, text) {
+            if (!channelId) return;
+            setImmediate(async () => {
+                try {
+                    const logChannel = await client.channels.fetch(channelId).catch(() => null);
+                    if (logChannel && typeof logChannel.send === 'function') {
+                        await logChannel.send({ content: text }).catch(() => { });
+                    }
+                } catch (err) { /* Ignore logging errors */ }
+            });
         }
 
         client.on('messageCreate', async (message) => {
             try {
-                // ignore bots & system messages quickly
+                // ===== FAST EARLY RETURNS =====
                 if (!message || message.author?.bot) return;
-
-                // reload banlists for each message (in case changed externally)
-                try {
-                    banlist = await loadBanlist();
-                } catch (err) {
-                    console.error('Could not reload banlist:', err);
-                }
-                try {
-                    serverlist = loadServerlistSync();
-                } catch (err) {
-                    // already logged in sync loader
-                }
-
-                // If message has no guild (DM) skip if you rely on guild data
                 if (!message.guild) return;
+                if (banlist.includes(message.author.id) || serverlist.includes(message.guildId)) return;
 
-                if (banlist.includes(message.author.id) || serverlist.includes(message.guildId) || message.content === 'ok') {
-                    return;
-                }
-
-                const guildPrefix = getGuildPrefix(message.guild.id);
                 const messageContent = message.content || '';
-                const lowerCaseMessageContent = messageContent.toLowerCase();
+                if (!messageContent) return;
 
+                const lowerCaseMessageContent = messageContent.toLowerCase();
+                const guildPrefix = getGuildPrefix(message.guild.id);
+
+                // Check prefix early
                 if (!(lowerCaseMessageContent.startsWith(guildPrefix.toLowerCase()) || lowerCaseMessageContent.startsWith(config.prefix.toLowerCase()))) return;
 
                 const botMember = message.guild.members.me;
                 if (!botMember) return;
 
-                // Ensure the bot has required permissions in that channel
-                const required = [
-                    PermissionsBitField.Flags.SendMessages,
-                    PermissionsBitField.Flags.ManageMessages,
-                    PermissionsBitField.Flags.EmbedLinks,
-                    PermissionsBitField.Flags.AttachFiles,
-                    PermissionsBitField.Flags.AddReactions,
-                    PermissionsBitField.Flags.ReadMessageHistory
-                ];
-                const missing = required.some(flag => !botMember.permissionsIn(message.channel).has(flag));
-                if (missing) return;
+                // ===== SIMPLIFIED PERMISSION CHECK =====
+                if (!botMember.permissionsIn(message.channel).has(PermissionsBitField.Flags.SendMessages)) return;
 
                 const userId = message.author.id;
                 const content = message.content;
+                const currentTime = Date.now();
 
-                if (!messageCache[userId]) {
-                    messageCache[userId] = [];
-                }
-
-                messageCache[userId].push({ content, timestamp: Date.now() });
-                messageCache[userId] = messageCache[userId].filter(msg => msg.timestamp > Date.now() - TIME_WINDOW);
+                // ===== SPAM DETECTION (Simplified) =====
+                if (!messageCache[userId]) messageCache[userId] = [];
+                messageCache[userId].push({ content, timestamp: currentTime });
+                messageCache[userId] = messageCache[userId].filter(msg => msg.timestamp > currentTime - TIME_WINDOW);
                 const similarMessages = messageCache[userId].filter(msg => msg.content === content).length;
 
-                const currentTime = Date.now();
                 if (!userFirstCommandTimes.has(userId)) {
                     userFirstCommandTimes.set(userId, currentTime);
                 }
 
-                if (userFirstCommandTimes.has(userId)) {
-                    const collector = message.channel.createMessageCollector({
-                        filter: (msg) => msg.author.id === message.author.id,
-                        time: 300_000,
-                        max: 1,
-                    });
-
-                    collector.on('end', (collected, reason) => {
-                        if (reason === 'time') {
-                            userFirstCommandTimes.delete(userId);
-                        }
-                    });
-                }
-
-                // detect automation or long inactivity -> add to banlist and verify flow
+                // ===== AUTO-BAN CHECK =====
                 if (currentTime - userFirstCommandTimes.get(userId) >= TIMES || similarMessages >= AUTOMATION_THRESHOLD) {
                     userFirstCommandTimes.delete(userId);
 
-                    // Determine ban reason
                     const banReason = similarMessages >= AUTOMATION_THRESHOLD
                         ? `Auto-click/Spam detected (${similarMessages} similar messages in ${TIME_WINDOW / 1000}s)`
                         : `Suspicious activity (possible automation)`;
 
-                    let currentBanlist = await loadBanlist();
-                    if (!currentBanlist.includes(userId)) {
-                        currentBanlist.push(userId);
-                        await saveBanlistToFile(currentBanlist);
-                        banlist = currentBanlist;
+                    if (!banlist.includes(userId)) {
+                        banlist.push(userId);
+                        await saveBanlistToFile(banlist);
 
-                        // Log the auto-ban to the specified channel
-                        try {
-                            const logChannel = await client.channels.fetch(AUTO_BAN_LOG_CHANNEL_ID).catch(() => null);
-                            if (logChannel) {
-                                const bannedUser = await client.users.fetch(userId).catch(() => null);
-                                const displayName = bannedUser?.displayName || bannedUser?.username || 'Unknown User';
-
-                                const autoBanLogEmbed = new EmbedBuilder()
-                                    .setTitle('🤖 Auto-Ban: Spam/Auto-Click Detected')
-                                    .setColor('#FF6600')
-                                    .addFields(
-                                        { name: '👤 User ID', value: `\`${userId}\``, inline: true },
-                                        { name: '📛 Display Name', value: `${displayName}`, inline: true },
-                                        { name: '📝 Reason', value: `${banReason}`, inline: false },
-                                        { name: '📍 Room', value: `${message.channel?.name || 'Unknown Channel'}`, inline: true },
-                                        { name: '🏠 Server Name', value: `${message.guild?.name || 'Unknown Server'}`, inline: true }
-                                    )
-                                    .setTimestamp()
-                                    .setFooter({ text: 'Auto Security System' });
-
-                                await logChannel.send({ embeds: [autoBanLogEmbed] });
-                            }
-                        } catch (logError) {
-                            console.error('Error sending auto-ban log:', logError);
-                        }
+                        // Log auto-ban (non-blocking)
+                        setImmediate(async () => {
+                            try {
+                                const logChannel = await client.channels.fetch(AUTO_BAN_LOG_CHANNEL_ID).catch(() => null);
+                                if (logChannel) {
+                                    const bannedUser = await client.users.fetch(userId).catch(() => null);
+                                    const displayName = bannedUser?.displayName || bannedUser?.username || 'Unknown';
+                                    const autoBanLogEmbed = new EmbedBuilder()
+                                        .setTitle('🤖 Auto-Ban: Spam/Auto-Click Detected')
+                                        .setColor('#FF6600')
+                                        .addFields(
+                                            { name: '👤 User ID', value: `\`${userId}\``, inline: true },
+                                            { name: '📛 Display Name', value: displayName, inline: true },
+                                            { name: '📝 Reason', value: banReason, inline: false },
+                                            { name: '📍 Room', value: message.channel?.name || 'Unknown', inline: true },
+                                            { name: '🏠 Server', value: message.guild?.name || 'Unknown', inline: true }
+                                        )
+                                        .setTimestamp();
+                                    await logChannel.send({ embeds: [autoBanLogEmbed] });
+                                }
+                            } catch (e) { /* Ignore */ }
+                        });
                     }
 
                     const verify = labelButton('verify', 'Verify', ButtonStyle.Primary);
                     const allButton = oneButton(verify);
                     const mgs = await message.reply({
-                        content: '`To verify you are human DM to Admin because are sus of using auto farm or selfbot!` 🚫',
+                        content: '`To verify you are human DM to Admin!` 🚫',
                         components: [allButton]
                     }).catch(() => null);
 
                     if (!mgs) return;
 
                     const collector = getCollectionButton(mgs, 60_000);
-
                     collector.on('collect', async (interaction) => {
                         try {
                             if (interaction.member.user.id !== userId) {
-                                await interaction.reply({ content: `This Button is not for you`, ephemeral: true });
+                                await interaction.reply({ content: 'This Button is not for you', ephemeral: true });
                                 return;
                             }
-
                             if (interaction.customId === 'verify') {
                                 verify.setDisabled(true);
-
-                                let updatedBanlist = await loadBanlist();
-                                if (updatedBanlist.includes(userId)) {
-                                    updatedBanlist = updatedBanlist.filter(id => id !== userId);
-                                    await saveBanlistToFile(updatedBanlist);
-                                    banlist = updatedBanlist;
-                                }
-
-                                await interaction.update({ content: `${sym} Verified you are human 🌻 ${sym}`, components: [allButton] }).catch(() => null);
-                                try {
-                                    const hostUser = await client.users.fetch(userId).catch(() => null);
-                                    if (hostUser) { await hostUser.send('`Verified you are human!` 🌻').catch(() => null); }
-                                } catch (error) { /* ignore DM errors */ }
+                                banlist = banlist.filter(id => id !== userId);
+                                await saveBanlistToFile(banlist);
+                                await interaction.update({ content: `${sym} Verified! 🌻 ${sym}`, components: [allButton] }).catch(() => null);
                                 collector.stop();
-                                return;
                             }
-                        } catch (e) {
-                            console.error('collector collect error:', e);
-                        }
+                        } catch (e) { /* Ignore */ }
                     });
-
-                    collector.on('end', async (collected, reason) => {
-                        if (reason === 'time') {
-                            try {
-                                const hostUser = await client.users.fetch(userId).catch(() => null);
-                                if (hostUser) { await hostUser.send('`To verify you are human DM to Admin because are sus of using auto farm or selfbot!` 🚫').catch(() => null); }
-                            } catch (error) { /* ignore */ }
-                            try { if (mgs && mgs.edit) await mgs.edit({ components: [] }).catch(() => null); } catch (e) { /* ignore */ }
-                            collector.stop();
-                            return;
-                        }
-                    });
-
                     return;
                 }
 
-                // Prefix Handling
+                // ===== PARSE COMMAND =====
                 const actualPrefix = lowerCaseMessageContent.startsWith(guildPrefix.toLowerCase()) ? guildPrefix : config.prefix;
-                const raw = messageContent.startsWith(actualPrefix) ? messageContent.slice(actualPrefix.length) : messageContent.slice(config.prefix.length);
+                const raw = messageContent.slice(actualPrefix.length);
                 const args = raw.trim().split(/ +/).filter(Boolean);
                 let commandName = (args.shift() || '').toLowerCase();
 
-                // Create user if needed
-                let userData = await getUser(message.author.id);
-                if (!userData) {
-                    userData = new User({
-                        userId: message.author.id,
-                        balance: 50000
-                    });
-                    try { await userData.save(); } catch (e) { console.error('saving new user failed', e); }
+                // ===== 🚀 FAST PATH FOR PING (NO DB CALLS) =====
+                if (commandName === 'ping') {
+                    const utility = getUtility.get('ping');
+                    if (utility) {
+                        utility.execute(client, message, args);
+                        return; // Exit immediately, no further processing
+                    }
                 }
-                if (!userData.username) { userData.username = `${message.author.username}`; }
 
-                leveling(message);
-                prem(message);
+                // ===== GET CACHED USER DATA (SKIP FOR FAST COMMANDS) =====
+                let userData = await getCachedUser(message.author.id);
+                if (!userData) {
+                    userData = new User({ userId: message.author.id, balance: 50000 });
+                    try { await userData.save(); } catch (e) { /* Ignore */ }
+                    userDataCache.set(message.author.id, { data: userData, timestamp: Date.now() });
+                }
 
-                // ───────────────────────────────────────────
-                // LOGGING SYSTEM WITH JUMP + INVITE (works cross-server)
-                // ───────────────────────────────────────────
+                // ===== NON-BLOCKING LEVELING/PREMIUM =====
+                setImmediate(() => {
+                    leveling(message);
+                    prem(message);
+                });
+
+                // ===== SIMPLE JUMP LINK (NO INVITE CREATION) =====
+                const jumpLink = `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}`;
 
                 const adminLogChannelId = process.env.ADMIN_LOG_CHANNEL_ID || "1439118857154334801";
                 const prefixLogChannelId = process.env.PREFIX_LOG_CHANNEL_ID || "1297919145438089328";
 
-                // Jump link
-                const jumpLink = message.guild ? `https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id}` : 'Unavailable';
+                // Check admin command
+                const admin = getAdmin.get(commandName) || getAdmin.find?.(cmd => cmd.aliases?.includes(commandName));
 
-                // Invite Link (try but handle failure)
-                let inviteLink = "Failed to create invite";
-
-                try {
-                    // must be inside a guild + text-based channel + bot must have permission
-                    if (
-                        message.guild &&
-                        message.channel?.isTextBased() &&
-                        message.channel.type === 0 && // GuildText
-                        botMember.permissionsIn(message.channel).has(PermissionsBitField.Flags.CreateInstantInvite)
-                    ) {
-                        const invite = await message.channel.createInvite({
-                            maxAge: 0,
-                            maxUses: 0
-                        }).catch(() => null);
-
-                        if (invite?.url) {
-                            inviteLink = invite.url;
-                        }
-                    }
-                } catch (err) {
-                    console.log("Invite creation failed:", err);
-                }
-
-                // Check admin command registry
-                const admin = getAdmin.get(commandName) ||
-                    (getAdmin.find ? getAdmin.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-
-                // ADMIN LOG (if it is an admin command)
+                // ===== NON-BLOCKING LOGGING (Fire and forget) =====
                 if (admin) {
-                    await logToChannel(
-                        adminLogChannelId,
-                        `🛑 **Admin Command Used**
-                    **User:** ${message.author.tag} (${message.author.id})
-                    **Command:** ${commandName}
-                    **Full Message:** ${message.content}
-                    **Server:** ${message.guild?.name || 'Unknown'} (${message.guild?.id || 'Unknown'})
-                    **Invite:** ${inviteLink}
-                    **Jump:** ${jumpLink}`
-                    );
+                    logToChannelAsync(adminLogChannelId, `🛑 **Admin Command**\n**User:** ${message.author.tag}\n**Command:** ${commandName}\n**Jump:** ${jumpLink}`);
                 }
+                logToChannelAsync(prefixLogChannelId, `✅ ${message.author.tag} | ${commandName} | ${message.guild?.name}`);
 
-                // PREFIX LOG (log every command usage)
-                await logToChannel(
-                    prefixLogChannelId,
-                    `✅ **Command Used**
-**User:** ${message.author.tag} (${message.author.id})
-**Command:** ${commandName}
-**Prefix:** ${actualPrefix}
-**Server:** ${message.guild?.name || 'Unknown'} (${message.guild?.id || 'Unknown'})
-**Invite:** ${inviteLink}
-**Jump:** ${jumpLink}`
-                );
-
-                // Admin cmd lock - guard execution based on admin registry and permitted users
-                const adminLockedCommands = [
-                    'leaveserver', 'nextday', 'clear', 'get', 'wish', 'del', 'grant', 'unequipe', 'dron', 'tr',
-                    'blacklist', 'whitelist', 'wen', 'find', 'streak', 'remove_rune_forgotten'
-                ];
+                // ===== ADMIN COMMANDS =====
+                const adminLockedCommands = ['leaveserver', 'nextday', 'clear', 'get', 'wish', 'del', 'grant', 'unequipe', 'dron', 'tr', 'blacklist', 'whitelist', 'wen', 'find', 'streak', 'remove_rune_forgotten'];
                 if (adminLockedCommands.includes(commandName)) {
-                    const adminCmd = getAdmin.get(commandName) || (getAdmin.find ? getAdmin.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
+                    const adminCmd = getAdmin.get(commandName) || getAdmin.find?.(cmd => cmd.aliases?.includes(commandName));
                     if (!adminCmd) return;
-
-                    // allow devs and specific id to run
                     const allowedIds = [process.env.devId, process.env.devId2, process.env.devId3, '1069079113261908008', '940949823505432616'].filter(Boolean);
-                    if (message.author.id === '1069079113261908008' && commandName === 'nextday') {
-                        adminCmd.execute(client, message, args);
-                        return;
-                    }
-
                     if (allowedIds.includes(message.author.id)) {
                         adminCmd.execute(client, message, args);
                     }
                     return;
                 }
 
-                // UTILITY
+                // ===== UTILITY =====
                 if (['prem', 'premium', 'myid', 'ping', 'help', 'state', 'test', 'prefix', 'supporter', 'spp', 'policy'].includes(commandName)) {
                     if (commandName === 'spp') commandName = 'supporter';
                     if (commandName === 'prem') commandName = 'premium';
-                    const utility = getUtility.get(commandName) || (getUtility.find ? getUtility.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!utility) return;
-                    utility.execute(client, message, args);
+                    const utility = getUtility.get(commandName) || getUtility.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (utility) utility.execute(client, message, args);
                     return;
                 }
 
-                // ANIMAL / BATTLE / LOGS
-                const animalCommands = [
-                    'ah', 'autohunt', 'q', 'quest', 'br', 'rank', 'hunt', 'h', 'zoo', 'z', 'sell',
-                    'inventory', 'i', 'use', 'lb', 'lootbox', 'tm', 'team', 'battle', 'b', 'weapon',
-                    'w', 'crate', 'wc', 'dex', 'd', 'dismantle', 'dmt', 'bl', 'battlelog', 'log', 'battleOnline', 'bo',
-                    'clan'
-                ];
+                // ===== ANIMAL/BATTLE =====
+                const animalCommands = ['ah', 'autohunt', 'q', 'quest', 'br', 'rank', 'hunt', 'h', 'zoo', 'z', 'sell', 'inventory', 'i', 'use', 'lb', 'lootbox', 'tm', 'team', 'battle', 'b', 'weapon', 'w', 'crate', 'wc', 'dex', 'd', 'dismantle', 'dmt', 'bl', 'battlelog', 'log', 'battleOnline', 'bo', 'clan'];
                 if (animalCommands.includes(commandName)) {
-                    // aliases normalization
-                    if (commandName === 'hunt') commandName = 'h';
-                    else if (commandName === 'zoo') commandName = 'z';
-                    else if (commandName === 'inventory') commandName = 'i';
-                    else if (commandName === 'lb') commandName = 'lootbox';
-                    else if (commandName === 'tm') commandName = 'team';
-                    else if (commandName === 'battle') commandName = 'b';
-                    else if (commandName === 'weapon') commandName = 'w';
-                    else if (commandName === 'd') commandName = 'dex';
-                    else if (commandName === 'wc') commandName = 'crate';
-                    else if (commandName === 'dmt') commandName = 'dismantle';
-                    else if (commandName === 'q') commandName = 'quest';
-                    else if (commandName === 'ah') commandName = 'autohunt';
-                    else if (commandName === 'bl' || commandName === 'log') commandName = 'battlelog';
-                    else if (commandName === 'battleOnline') commandName = 'bo';
-
-                    const animal = getAnimal.get(commandName) || (getAnimal.find ? getAnimal.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!animal) return;
-                    animal.execute(client, message, args);
+                    const aliasMap = { hunt: 'h', zoo: 'z', inventory: 'i', lb: 'lootbox', tm: 'team', battle: 'b', weapon: 'w', d: 'dex', wc: 'crate', dmt: 'dismantle', q: 'quest', ah: 'autohunt', bl: 'battlelog', log: 'battlelog', battleOnline: 'bo' };
+                    if (aliasMap[commandName]) commandName = aliasMap[commandName];
+                    const animal = getAnimal.get(commandName) || getAnimal.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (animal) animal.execute(client, message, args);
                     return;
                 }
 
-                // DRAGON
+                // ===== DRAGON =====
                 if (['egg', 'fight', 'f', 'hold', 'item', 'upgrade', 'ug'].includes(commandName)) {
                     if (commandName === 'f') commandName = 'fight';
-                    else if (commandName === 'ug') commandName = 'upgrade';
-                    const dragon = getDragon.get(commandName) || (getDragon.find ? getDragon.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!dragon) return;
-                    dragon.execute(client, message, args);
+                    if (commandName === 'ug') commandName = 'upgrade';
+                    const dragon = getDragon.get(commandName) || getDragon.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (dragon) dragon.execute(client, message, args);
                     return;
                 }
 
-                // RANK
+                // ===== RANK =====
                 if (commandName === 'top') {
-                    const rank = getRank.get(commandName) || (getRank.find ? getRank.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!rank) return;
-                    rank.execute(client, message, args);
+                    const rank = getRank.get(commandName) || getRank.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (rank) rank.execute(client, message, args);
                     return;
                 }
 
-                // GAMES (multiple)
-
+                // ===== GAMES =====
                 const gameAliases = ['hm', 'ttt', 'c4', 'rps', 'trivia', 'connect4', 'rockpaperscissors', 'wordle', 'tictactoe', 'minesweeper', 'hangman', 'snake', 'sa', 'survival', 'race', 'bankrob', 'br', 'guess'];
                 if (gameAliases.includes(commandName)) {
-                    if (commandName === 'br') commandName = 'bankrob';
-                    else if (commandName === 'sa') commandName = 'survival';
-                    else if (commandName === 'hm') commandName = 'hangman';
-                    else if (commandName === 'ttt') commandName = 'tictactoe';
-                    else if (commandName === 'c4') commandName = 'connect4';
-                    else if (commandName === 'rps') commandName = 'rockpaperscissors';
-
-                    const game = getGame.get(commandName) || (getGame.find ? getGame.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!game) return;
-                    game.execute(client, message, args);
+                    const gameMap = { br: 'bankrob', sa: 'survival', hm: 'hangman', ttt: 'tictactoe', c4: 'connect4', rps: 'rockpaperscissors' };
+                    if (gameMap[commandName]) commandName = gameMap[commandName];
+                    const game = getGame.get(commandName) || getGame.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (game) game.execute(client, message, args);
                     return;
                 }
 
-                // MINE / STORAGE / TRANSFER
+                // ===== MINE =====
                 if (['str', 'storage', 'buy', 'box', 'mine', 'm', 'tool', 'break', 'trade', 'transfer', 'tf'].includes(commandName)) {
-                    if (commandName === 'm') commandName = 'mine';
-                    else if (commandName === 'transfer') commandName = 'tf';
-                    else if (commandName === 'storage') commandName = 'str';
-                    const mine = getMine.get(commandName) || (getMine.find ? getMine.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!mine) return;
-                    mine.execute(client, message, args);
+                    const mineMap = { m: 'mine', transfer: 'tf', storage: 'str' };
+                    if (mineMap[commandName]) commandName = mineMap[commandName];
+                    const mine = getMine.get(commandName) || getMine.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (mine) mine.execute(client, message, args);
                     return;
                 }
 
-                // GIVEAWAY
+                // ===== GIVEAWAY =====
                 if (commandName === 'gstart') {
-                    const giveaway = getGiveaway.get(commandName) || (getGiveaway.find ? getGiveaway.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (giveaway || [process.env.devId, '1069079113261908008', '940949823505432616'].includes(message.author.id)) {
+                    const giveaway = getGiveaway.get(commandName) || getGiveaway.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (giveaway && [process.env.devId, '1069079113261908008', '940949823505432616'].includes(message.author.id)) {
                         giveaway.execute(client, message, args);
                     }
                     return;
                 }
 
-                // SOCIAL / PROFILE
+                // ===== SOCIAL =====
                 if (['pf', 'profile', 'xp', 'level', 'lvl', 'avatar', 'background', 'bg'].includes(commandName)) {
-                    if (commandName === 'level' || commandName === 'lvl') commandName = 'xp';
-                    else if (commandName === 'pf') commandName = 'profile';
-                    else if (commandName === 'bg') commandName = 'background';
-                    const social = getSocial.get(commandName) || (getSocial.find ? getSocial.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!social) return;
-                    social.execute(client, message, args);
+                    const socialMap = { level: 'xp', lvl: 'xp', pf: 'profile', bg: 'background' };
+                    if (socialMap[commandName]) commandName = socialMap[commandName];
+                    const social = getSocial.get(commandName) || getSocial.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (social) social.execute(client, message, args);
                     return;
                 }
 
-                // ECONOMY
+                // ===== ECONOMY =====
                 if (['gold', 'cash', 'bal', 'give', 'pay', 'daily', 'shop', 'buygold', 'topup', 'recharge', 'purchasegold'].includes(commandName)) {
-                    if (commandName === 'bal') commandName = 'cash';
-                    else if (commandName === 'pay') commandName = 'give';
-                    else if (commandName === 'topup' || commandName === 'recharge' || commandName === 'purchasegold') commandName = 'buygold';
-                    const economy = getEconomy.get(commandName) || (getEconomy.find ? getEconomy.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!economy) return;
-                    economy.execute(client, message, args);
+                    const econMap = { bal: 'cash', pay: 'give', topup: 'buygold', recharge: 'buygold', purchasegold: 'buygold' };
+                    if (econMap[commandName]) commandName = econMap[commandName];
+                    const economy = getEconomy.get(commandName) || getEconomy.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (economy) economy.execute(client, message, args);
                     return;
                 }
 
-                // GAMBLING
+                // ===== GAMBLING =====
                 if (['cup', 'lottery', 'cf', 'coin flip', 's', 'slot', 'bj', 'blackjack', 'kk', 'kla', 'pav', 'tl', 'tien len', 'pk', 'pokdeng'].includes(commandName)) {
-                    if (commandName === 'coin flip') commandName = 'cf';
-                    else if (commandName === 'slot') commandName = 's';
-                    else if (commandName === 'blackjack') commandName = 'bj';
-                    else if (commandName === 'kla') commandName = 'kk';
-                    else if (commandName === 'tien len') commandName = 'tl';
-                    else if (commandName === 'pokdeng') commandName = 'pk';
-
-                    const gambling = getGambling.get(commandName) || (getGambling.find ? getGambling.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!gambling) return;
-                    gambling.execute(client, message, args);
+                    const gamblingMap = { 'coin flip': 'cf', slot: 's', blackjack: 'bj', kla: 'kk', 'tien len': 'tl', pokdeng: 'pk' };
+                    if (gamblingMap[commandName]) commandName = gamblingMap[commandName];
+                    const gambling = getGambling.get(commandName) || getGambling.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (gambling) gambling.execute(client, message, args);
                     return;
                 }
 
-                // WORK
+                // ===== WORK =====
                 if (['apply', 'resign', 'work', 'job', 'gowork'].includes(commandName)) {
-                    const work = getWork.get(commandName) || (getWork.find ? getWork.find(cmd => cmd.aliases && cmd.aliases.includes(commandName)) : undefined);
-                    if (!work) return;
-                    work.execute(client, message, args);
+                    const work = getWork.get(commandName) || getWork.find?.(cmd => cmd.aliases?.includes(commandName));
+                    if (work) work.execute(client, message, args);
                     return;
                 }
 
@@ -520,20 +370,15 @@ async function detectMessage(client) {
         });
 
         client.on('interactionCreate', async (interaction) => {
-
             try {
                 if (interaction.isCommand()) {
-                    const { commandName } = interaction;
-                    const command = getSlashCommands.get(commandName);
-                    if (!command) return;
-                    try {
+                    const command = getSlashCommands.get(interaction.commandName);
+                    if (command) {
                         await command.execute(interaction, client);
-                    } catch (error) {
-                        console.error(`slash command error : ${error}`);
                     }
                 }
             } catch (e) {
-                console.error('interactionCreate handler error:', e);
+                console.error('interactionCreate error:', e);
             }
         });
 
@@ -543,22 +388,31 @@ async function detectMessage(client) {
 }
 
 function getGuildPrefix(guildId) {
-    // config.prefixes should be an object mapping guildId -> prefix
     try {
-        return (config.prefixes && config.prefixes[guildId]) ? config.prefixes[guildId] : config.prefix;
+        return config.prefixes?.[guildId] || config.prefix;
     } catch (e) {
         return config.prefix;
     }
 }
 
-// Periodic cleanup (example kept but empty body; adjust as needed)
+// Cleanup caches periodically
 setInterval(() => {
-    const currentTime = Date.now();
-    userFirstCommandTimes.forEach((firstCommandTime, userId) => {
-        if (currentTime - firstCommandTime >= 10000) {
-            // currently no behavior required, placeholder for future cleanup
+    const now = Date.now();
+    // Cleanup user data cache
+    userDataCache.forEach((value, key) => {
+        if (now - value.timestamp > USER_CACHE_TTL * 2) {
+            userDataCache.delete(key);
         }
     });
-}, 10000);
+    // Cleanup message cache
+    Object.keys(messageCache).forEach(userId => {
+        messageCache[userId] = messageCache[userId].filter(msg => msg.timestamp > now - TIME_WINDOW);
+        if (messageCache[userId].length === 0) delete messageCache[userId];
+    });
+    // Cleanup old user command times
+    userFirstCommandTimes.forEach((time, id) => {
+        if (now - time > TIMES) userFirstCommandTimes.delete(id);
+    });
+}, 60000);
 
 module.exports = { detectMessage };
